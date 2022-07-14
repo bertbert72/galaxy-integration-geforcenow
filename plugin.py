@@ -5,7 +5,7 @@ import os
 import re
 import sqlite3
 import sys
-import urllib.request
+import http.client
 from contextlib import contextmanager
 from galaxy.api.consts import Platform, LocalGameState
 from galaxy.api.plugin import Plugin, create_and_run_plugin
@@ -23,7 +23,7 @@ class GFNPlugin(Plugin):
 	def __init__(self, reader, writer, token):
 		super().__init__(
 			Platform.Test,  # choose platform from available list
-			"0.1",  # version
+			"0.2",  # version
 			reader,
 			writer,
 			token
@@ -31,7 +31,7 @@ class GFNPlugin(Plugin):
 
 	# implement methods
 	@staticmethod
-	def gfn_convert(_store: str, _title: str):
+	async def gfn_convert(_store: str, _title: str):
 		_store = _store.lower()
 		if _store == 'ubisoft connect':
 			_store = 'uplay'
@@ -40,7 +40,7 @@ class GFNPlugin(Plugin):
 
 		return _store + '_' + _title
 
-	def name_fix(self, _original: str):
+	async def name_fix(self, _original: str):
 		global gfn_mappings
 
 		translated = _original
@@ -51,7 +51,7 @@ class GFNPlugin(Plugin):
 
 		return translated
 
-	def get_games(self):
+	async def get_games(self):
 		global local_games
 		global gfn_mappings
 
@@ -65,21 +65,34 @@ class GFNPlugin(Plugin):
 		else:
 			log.debug('Could not find mappings file [{0}]'.format(str(mappings_file)))
 
-		gfn_url = 'https://static.nvidiagrid.net/supported-public-game-list/gfnpc.json'
+		gfn_site = 'api-prod.nvidia.com'
 
-		with urllib.request.urlopen(gfn_url) as url:
-			gfn_data = json.loads(url.read().decode())
+		conn = http.client.HTTPSConnection(gfn_site, timeout=20)
+		payload = "{apps(country:\"DE\" language:\"de_DE\"){numberReturned,pageInfo{endCursor,hasNextPage},items{title,sortName,variants{appStore,publisherName,id}}}}\r\n"
+		conn.request("POST", "/gfngames/v1/gameList", payload)
+		res = conn.getresponse()
 
 		gfn_games = []
 		gfn_steam = []
 		gfn_ids = {}
-		for game in gfn_data:
-			if 'store' in game and 'title' in game:
-				gg_id = self.gfn_convert(game["store"], game["title"])
-				gfn_games.append(gg_id)
-				gfn_ids[gg_id] = game["id"]
-				if game["steamUrl"] != "":
-					gfn_steam.append(game["steamUrl"].replace("https://store.steampowered.com/app/", "steam_"))
+		
+		if res.status == 200:
+			data = res.read().decode("utf-8")
+			json_data = json.loads(data)
+			items = json_data['data']['apps']['items']
+
+			for item in items:
+				name = item['title']
+				variants = item['variants']
+				for variant in variants:
+					store = variant['appStore']
+					id = variant['id']
+					
+					gg_id = await self.gfn_convert(store, name)
+					gfn_games.append(gg_id)
+					gfn_ids[gg_id] = id
+		else:
+			log.error("Failure contacting GFN server, response code: {0}".format(res.status))
 
 		with self.open_db() as cursor:
 			sql = """
@@ -98,14 +111,21 @@ class GFNPlugin(Plugin):
 		log.debug("GFN games: {0}".format(gfn_games))
 		log.debug("GFN ids: {0}".format(gfn_ids))
 		for game in owned_games:
-			test_title = self.gfn_convert(game[PLATFORM], game[TITLE])
-			test_title = self.name_fix(test_title)
+			test_title = await self.gfn_convert(game[PLATFORM], game[TITLE])
+			test_title = await self.name_fix(test_title)
 			game_id = ''
 
 			if game[KEY] in gfn_steam:
 				game_id = game[KEY].replace('steam_', 'gfn_')
 			elif test_title in gfn_games:
 				game_id = 'gfn_' + str(gfn_ids[test_title])
+				#if 'Xepic_pillarsofeternitydefinitiveedition' != test_title and \
+				#	'Xepic_alanwakesamericannightmare' != test_title and \
+				#	'Xepic_fortheking' != test_title and \
+				#	'Xuplay_watchdogs' != test_title and \
+				#	'Xepic_assassinscreedsyndicate' != test_title and \
+				#	'Xepic_risingstorm2vietnam' != test_title:
+				#		matched_games.append(Game(game_id, game[TITLE], None, LicenseInfo(LicenseType.SinglePurchase)))
 			else:
 				log.debug("Not found {0}: {1} [{2}]".format(game[PLATFORM], game[TITLE], test_title))
 
@@ -115,6 +135,7 @@ class GFNPlugin(Plugin):
 				local_game = LocalGame(game_id, LocalGameState.Installed)
 				self.local_games.append(local_game)
 
+		log.debug('Matched games: {0}'.format(str(matched_games)))
 		return matched_games
 
 	@contextmanager
@@ -144,7 +165,7 @@ class GFNPlugin(Plugin):
 		return Authentication('anonymous', 'Anonymous')
 
 	async def get_owned_games(self):
-		return self.get_games()
+		return await self.get_games()
 
 	async def launch_game(self, game_id):
 		a_key = r"GeForceNOW\Shell\Open\Command"
